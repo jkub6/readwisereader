@@ -89,6 +89,7 @@ function ReadwiseReader:init()
     self.directory = settings.directory
     self.archive_finished = settings.archive_finished
     self.export_highlights_at_sync = settings.export_highlights_at_sync or false
+    self.export_only_readwise_folder = settings.export_only_readwise_folder or false
     self.last_sync_time = settings.last_sync_time
     
     self.available_tags = settings.available_tags or {}
@@ -510,9 +511,11 @@ function ReadwiseReader:parseAllBooks()
         end
     end
     
-    -- Remove empty books
+    -- Remove empty books and filter to only include books from our directory
     for title, booknotes in pairs(clippings) do
         if #booknotes == 0 then
+            clippings[title] = nil
+        elseif self.export_only_readwise_folder and (not booknotes.file or string.sub(booknotes.file, 1, string.len(self.directory)) ~= self.directory) then
             clippings[title] = nil
         end
     end
@@ -667,6 +670,16 @@ function ReadwiseReader:addToMainMenu(menu_items)
                         end,
                         callback = function()
                             self.export_highlights_at_sync = not self.export_highlights_at_sync
+                            self:saveSettings()
+                        end,
+                    },
+                    {
+                        text = "Export only Readwise articles",
+                        checked_func = function() 
+                            return self.export_only_readwise_folder 
+                        end,
+                        callback = function()
+                            self.export_only_readwise_folder = not self.export_only_readwise_folder
                             self:saveSettings()
                         end,
                     },
@@ -2295,6 +2308,7 @@ function ReadwiseReader:saveSettings()
         directory = self.directory,
         archive_finished = self.archive_finished,
         export_highlights_at_sync = self.export_highlights_at_sync,
+        export_only_readwise_folder = self.export_only_readwise_folder,
         last_sync_time = self.last_sync_time,
         available_tags = self.available_tags,
         excluded_tags = self.excluded_tags,
