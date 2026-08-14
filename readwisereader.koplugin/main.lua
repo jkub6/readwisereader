@@ -1598,8 +1598,10 @@ function ReadwiseReader:downloadDocument(document)
         return "skipped"
     end
 
-    -- Route PDF documents to dedicated download path
-    if document.category == "pdf" then
+    -- Download as native PDF when Readwise explicitly categorizes it as PDF,
+    -- or when a raw source file is available (catches PDFs categorized as "article")
+    if document.category == "pdf"
+       or (document.raw_source_url and document.raw_source_url ~= "") then
         return self:downloadPdfDocument(document)
     end
 
@@ -1607,18 +1609,19 @@ function ReadwiseReader:downloadDocument(document)
 end
 
 function ReadwiseReader:downloadPdfDocument(document)
-    -- Determine download URL: prefer raw_source_url (pre-signed S3 link),
-    -- fall back to source_url, then to HTML if neither is available
-    local download_url = nil
-
+    -- Build list of candidate URLs to try for the original PDF.
+    -- Readwise often stores parsed HTML on S3 (raw_source_url) even for PDFs,
+    -- so we try each URL and verify via magic bytes before accepting it.
+    local candidate_urls = {}
     if document.raw_source_url and document.raw_source_url ~= "" then
-        download_url = document.raw_source_url
-        logger.dbg("ReadwiseReader:downloadPdfDocument: using raw_source_url (S3)")
-    elseif document.source_url and document.source_url ~= "" then
-        download_url = document.source_url
-        logger.dbg("ReadwiseReader:downloadPdfDocument: using source_url fallback")
-    else
-        logger.warn("ReadwiseReader:downloadPdfDocument: no download URL for", document.id, "- falling back to HTML")
+        table.insert(candidate_urls, document.raw_source_url)
+    end
+    if document.source_url and document.source_url ~= "" then
+        table.insert(candidate_urls, document.source_url)
+    end
+
+    if #candidate_urls == 0 then
+        logger.dbg("ReadwiseReader:downloadPdfDocument: no candidate URLs, falling back to HTML")
         return self:downloadHtmlDocument(document)
     end
 
@@ -1629,31 +1632,43 @@ function ReadwiseReader:downloadPdfDocument(document)
     local filename = article_id_prefix .. document.id .. article_id_postfix .. title .. ".pdf"
     local filepath = self.directory .. filename
 
-    logger.dbg("ReadwiseReader:downloadPdfDocument: downloading", document.id, "from", download_url)
+    -- Try each candidate URL until we find one that returns a valid PDF
+    local pdf_data = nil
+    for _, url in ipairs(candidate_urls) do
+        logger.dbg("ReadwiseReader:downloadPdfDocument: trying", url)
 
-    local response = {}
-    local request = {
-        url = download_url,
-        sink = ltn12.sink.table(response),
-        method = "GET",
-        headers = {
-            ["User-Agent"] = "Mozilla/5.0 (compatible; KOReader Readwise Plugin)",
-            ["Accept"] = "application/pdf,*/*;q=0.8",
-        },
-    }
+        local response = {}
+        local request = {
+            url = url,
+            sink = ltn12.sink.table(response),
+            method = "GET",
+            headers = {
+                ["User-Agent"] = "Mozilla/5.0 (compatible; KOReader Readwise Plugin)",
+                ["Accept"] = "application/pdf,*/*;q=0.8",
+            },
+        }
 
-    socketutil:set_timeout(10, 120)
-    local code = socket.skip(1, http.request(request))
-    socketutil:reset_timeout()
+        socketutil:set_timeout(10, 120)
+        local code = socket.skip(1, http.request(request))
+        socketutil:reset_timeout()
 
-    if code ~= 200 then
-        logger.warn("ReadwiseReader:downloadPdfDocument: HTTP", code, "for", download_url, "- falling back to HTML")
-        return self:downloadHtmlDocument(document)
+        if code == 200 then
+            local data = table.concat(response)
+            -- Verify content is actually a PDF (magic bytes)
+            if #data >= 5 and data:sub(1, 5) == "%PDF-" then
+                pdf_data = data
+                logger.dbg("ReadwiseReader:downloadPdfDocument: got valid PDF from", url)
+                break
+            else
+                logger.dbg("ReadwiseReader:downloadPdfDocument: not a PDF from", url, "- trying next")
+            end
+        else
+            logger.dbg("ReadwiseReader:downloadPdfDocument: HTTP", code, "from", url, "- trying next")
+        end
     end
 
-    local pdf_data = table.concat(response)
-    if #pdf_data == 0 then
-        logger.warn("ReadwiseReader:downloadPdfDocument: empty response - falling back to HTML")
+    if not pdf_data then
+        logger.dbg("ReadwiseReader:downloadPdfDocument: no candidate returned a PDF, falling back to HTML")
         return self:downloadHtmlDocument(document)
     end
 
