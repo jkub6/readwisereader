@@ -6,7 +6,7 @@
 --
 -- MAIN FEATURES:
 -- - Downloads articles from Readwise Reader "later" and "shortlist" locations
--- - Converts articles to HTML format with embedded images
+-- - Downloads PDF documents natively; converts other articles to HTML with embedded images
 -- - Generates KOReader metadata sidecars (.sdr) for enhanced library integration
 -- - Automatically manages KOReader collections based on article location
 -- - Offers filtering by article tags, location, type and site name (via series)
@@ -1403,7 +1403,7 @@ function ReadwiseReader:getDocumentList()
                 self:showProgress(string.format("Getting %s articles (%d kept)…", location_display, #documents))
 
                 -- Fetch with HTML content and tags for batch processing
-                local endpoint = "/list/?location=" .. location .. "&withHtmlContent=true&withTags=true"
+                local endpoint = "/list/?location=" .. location .. "&withHtmlContent=true&withTags=true&withRawSourceUrl=true"
                 if self.sync_only_koreader_tag then
                     endpoint = endpoint .. "&tag=koreader"
                 end
@@ -1491,7 +1491,7 @@ end
 
 function ReadwiseReader:forEachLocalDocument(callback)
     for entry in lfs.dir(self.directory) do
-        if entry:match("%.html$") then
+        if entry:match("%.html$") or entry:match("%.pdf$") then
             local filepath = self.directory .. entry
             if lfs.attributes(filepath, "mode") == "file" then
                 local doc_id = self:getDocumentIdFromPath(filepath)
@@ -1592,12 +1592,102 @@ function ReadwiseReader:downloadDocument(document)
         logger.dbg("ReadwiseReader:downloadDocument: skipping", document.id, "- has excluded tags or location")
         return "skipped"
     end
-    
+
     if self:documentExists(document.id) then
         logger.dbg("ReadwiseReader:downloadDocument: skipping", document.id, "- already exists")
         return "skipped"
     end
-    
+
+    -- Route PDF documents to dedicated download path
+    if document.category == "pdf" then
+        return self:downloadPdfDocument(document)
+    end
+
+    return self:downloadHtmlDocument(document)
+end
+
+function ReadwiseReader:downloadPdfDocument(document)
+    -- Determine download URL: prefer raw_source_url (pre-signed S3 link),
+    -- fall back to source_url, then to HTML if neither is available
+    local download_url = nil
+
+    if document.raw_source_url and document.raw_source_url ~= "" then
+        download_url = document.raw_source_url
+        logger.dbg("ReadwiseReader:downloadPdfDocument: using raw_source_url (S3)")
+    elseif document.source_url and document.source_url ~= "" then
+        download_url = document.source_url
+        logger.dbg("ReadwiseReader:downloadPdfDocument: using source_url fallback")
+    else
+        logger.warn("ReadwiseReader:downloadPdfDocument: no download URL for", document.id, "- falling back to HTML")
+        return self:downloadHtmlDocument(document)
+    end
+
+    self:storeAuthorMetadata(document.id, document.author)
+    self:storeSourceUrlMetadata(document.id, document.source_url)
+
+    local title = util.getSafeFilename(document.title or "Untitled", self.directory, 200, 0)
+    local filename = article_id_prefix .. document.id .. article_id_postfix .. title .. ".pdf"
+    local filepath = self.directory .. filename
+
+    logger.dbg("ReadwiseReader:downloadPdfDocument: downloading", document.id, "from", download_url)
+
+    local response = {}
+    local request = {
+        url = download_url,
+        sink = ltn12.sink.table(response),
+        method = "GET",
+        headers = {
+            ["User-Agent"] = "Mozilla/5.0 (compatible; KOReader Readwise Plugin)",
+            ["Accept"] = "application/pdf,*/*;q=0.8",
+        },
+    }
+
+    socketutil:set_timeout(10, 120)
+    local code = socket.skip(1, http.request(request))
+    socketutil:reset_timeout()
+
+    if code ~= 200 then
+        logger.warn("ReadwiseReader:downloadPdfDocument: HTTP", code, "for", download_url, "- falling back to HTML")
+        return self:downloadHtmlDocument(document)
+    end
+
+    local pdf_data = table.concat(response)
+    if #pdf_data == 0 then
+        logger.warn("ReadwiseReader:downloadPdfDocument: empty response - falling back to HTML")
+        return self:downloadHtmlDocument(document)
+    end
+
+    local file, err = io.open(filepath, "wb")
+    if not file then
+        logger.err("ReadwiseReader:downloadPdfDocument: failed to open file for writing:", err)
+        return "failed"
+    end
+
+    local success = file:write(pdf_data)
+    file:close()
+
+    if success then
+        logger.dbg("ReadwiseReader:downloadPdfDocument: saved", document.id, "to", filepath)
+
+        local status, meta_err = pcall(function() self:setDocumentMetadata(filepath, document) end)
+        if not status then
+            logger.warn("ReadwiseReader:downloadPdfDocument: metadata writing failed:", meta_err)
+        end
+
+        local coll_status, coll_err = pcall(function() self:updateDocumentCollections(filepath, document) end)
+        if not coll_status then
+            logger.warn("ReadwiseReader:downloadPdfDocument: collection update failed:", coll_err)
+        end
+
+        return "downloaded"
+    else
+        logger.err("ReadwiseReader:downloadPdfDocument: failed to write file")
+        os.remove(filepath)
+        return "failed"
+    end
+end
+
+function ReadwiseReader:downloadHtmlDocument(document)
     -- Store author metadata from the API
     self:storeAuthorMetadata(document.id, document.author)
 
@@ -1608,7 +1698,7 @@ function ReadwiseReader:downloadDocument(document)
     local content = document.html_content
 
     if not content or content == "" or type(content) ~= "string" then
-        logger.warn("ReadwiseReader:downloadDocument: no HTML content available for", document.id)
+        logger.warn("ReadwiseReader:downloadHtmlDocument: no HTML content available for", document.id)
 
         local basic_content = string.format([[
 <h1>%s</h1>
@@ -1623,43 +1713,43 @@ function ReadwiseReader:downloadDocument(document)
             document.source_url or "",
             document.summary or "No summary available"
         )
-        
+
         content = basic_content
     end
-    
+
     local title = util.getSafeFilename(document.title or "Untitled", self.directory, 200, 0)
     local filename = article_id_prefix .. document.id .. article_id_postfix .. title .. ".html"
     local filepath = self.directory .. filename
-    
+
     local processed_content = self:processHtmlContent(content, document)
-    
+
     local file, err = io.open(filepath, "w")
     if not file then
-        logger.err("ReadwiseReader:downloadDocument: failed to open file for writing:", err)
+        logger.err("ReadwiseReader:downloadHtmlDocument: failed to open file for writing:", err)
         return "failed"
     end
-    
+
     local success = file:write(processed_content)
     file:close()
-    
+
     if success then
-        logger.dbg("ReadwiseReader:downloadDocument: saved", document.id, "to", filepath)
+        logger.dbg("ReadwiseReader:downloadHtmlDocument: saved", document.id, "to", filepath)
 
         -- Write metadata sidecar file for KOReader library integration
         local status, err = pcall(function() self:setDocumentMetadata(filepath, document) end)
         if not status then
-            logger.warn("ReadwiseReader:downloadDocument: metadata writing failed:", err)
+            logger.warn("ReadwiseReader:downloadHtmlDocument: metadata writing failed:", err)
         end
 
         -- Update KOReader collections
         local coll_status, coll_err = pcall(function() self:updateDocumentCollections(filepath, document) end)
         if not coll_status then
-            logger.warn("ReadwiseReader:downloadDocument: collection update failed:", coll_err)
+            logger.warn("ReadwiseReader:downloadHtmlDocument: collection update failed:", coll_err)
         end
 
         return "downloaded"
     else
-        logger.err("ReadwiseReader:downloadDocument: failed to write file")
+        logger.err("ReadwiseReader:downloadHtmlDocument: failed to write file")
         os.remove(filepath)
         return "failed"
     end
